@@ -3,24 +3,160 @@ use super::single_conn::{SingleConnection, start_connect};
 use error::Error;
 use std::sync::{Arc,Mutex};
 use Discord;
-use model::Event;
+use model::*;
 use serde_json;
+use std::collections::HashMap;
+use futures::sync::mpsc;
+use super::voice_internal::VoiceChannelNotice;
 
 pub struct Connection {
-    handle: Handle,
-    session_info: SessionInfoRef,
-    state: ConnState
+    upstream: Reconnector,
+    voice_cmd_rx: Option<mpsc::Receiver<::serde_json::Value>>,
+    voice_cmd_tx: Option<mpsc::Sender<::serde_json::Value>>,
+    pending_voice_cmd: Option<::serde_json::Value>,
+    voice_channels: HashMap<ServerId, Box<Sink<SinkItem=VoiceChannelNotice, SinkError=Error>>>,
+    user_id: Option<UserId>,
+    session_id: Option<String>,
 }
 
-enum ConnState {
-    Connecting(BoxFuture<SingleConnection, Error>),
-    Active(SingleConnection),
-    Closed()
+impl Stream for Connection {
+    type Item = Event;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        // Make progress on pushing things to voice control channels first
+        // We do this here, rather than in poll_complete, because sending to these channels is
+        // triggered by _incoming_ messages in the context of poll().
+        // There's no guarantee that the caller will invoke our poll_complete, well, ever.
+        for mut server_handle in self.voice_channels.values_mut() {
+            server_handle.poll_complete()?;
+        }
+
+        let result = self.upstream.poll();
+
+        match &result {
+            &Ok(Async::Ready(Some(Event::Ready(ref readyev)))) => {
+                let new_user_id = Some(readyev.user.id);
+                if new_user_id != self.user_id {
+                    self.user_id = new_user_id;
+                    self.voice_inform(&None, || VoiceChannelNotice::Init { user_id: new_user_id.unwrap() });
+                }
+
+                let new_session_id = Some(readyev.session_id.clone());
+                if new_session_id != self.session_id {
+                    self.session_id = new_session_id.clone();
+                    self.voice_inform(&None, || VoiceChannelNotice::SessionChange
+                        { session_id: new_session_id.unwrap() }
+                    );
+                }
+            },
+            &Ok(Async::Ready(Some(Event::Resumed { trace: _ }))) => {
+                // Let the voice session know, if it's waiting for a VoiceServerUpdate it'll resend
+                // the command in case it got dropped
+                self.voice_inform(&None, || VoiceChannelNotice::Resumed);
+            },
+            &Ok(Async::Ready(Some(Event::VoiceServerUpdate {
+                ref server_id, ref channel_id, ref endpoint, ref token
+            }))) => {
+                if server_id.is_some() {
+                    self.voice_inform(server_id,
+                                      || VoiceChannelNotice::VoiceServerUpdate {
+                                          endpoint: endpoint.clone(),
+                                          server_id: server_id.clone(),
+                                          token: token.clone(),
+                                          channel_id: channel_id.clone()
+                                      }
+                    );
+                }
+            },
+            &Ok(Async::NotReady) => {
+                // nothing to read? make sure we keep making progress on the send side as well.
+                self.process_voice_commands()?;
+            }
+            _ => { /* ignore */ }
+        }
+
+        return result;
+    }
+}
+
+impl Sink for Connection {
+    type SinkItem = serde_json::Value;
+    type SinkError = Error;
+
+    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+        self.process_voice_commands()?;
+
+        self.upstream.poll_complete()
+    }
+
+    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        self.process_voice_commands()?;
+
+        self.upstream.start_send(item)
+    }
+
+    fn close(&mut self) -> Poll<(), Self::SinkError> {
+        // Kill all voice connections immediately.
+        self.voice_cmd_rx = None;
+        self.voice_cmd_tx = None;
+        self.pending_voice_cmd = None;
+        self.voice_channels.clear();
+
+        self.upstream.close()
+    }
 }
 
 impl Connection {
+    fn voice_inform<T>(&mut self, server_id: &Option<ServerId>, message_provider: T)
+        where T: FnOnce()->VoiceChannelNotice
+    {
+        if server_id.is_some() {
+            if let Some(ref mut server_handle) = self.voice_channels.get_mut(&server_id.unwrap()) {
+                server_handle.start_send(message_provider());
+            };
+        } else {
+            let message = message_provider();
+            for mut server_handle in self.voice_channels.values_mut() {
+                server_handle.start_send(message.clone());
+            }
+        }
+    }
+
+    fn process_voice_commands(&mut self) -> Result<(), Error> {
+        if let Some(ref mut rx) = self.voice_cmd_rx {
+            if !self.pending_voice_cmd.is_some() {
+                match rx.poll() {
+                    Ok(Async::NotReady) => {},
+                    Ok(Async::Ready(None)) | Err(_) => {
+                        // Hmm... the tx end was lost. This should never happen.
+                        panic!("Impossible: voice command channel was closed");
+                    },
+                    Ok(Async::Ready(cmd)) => self.pending_voice_cmd = cmd,
+                }
+            }
+        }
+
+        if let Some(cmd) = self.pending_voice_cmd.take() {
+            match self.upstream.start_send(cmd)? {
+                AsyncSink::NotReady(cmd) => self.pending_voice_cmd = Some(cmd),
+                AsyncSink::Ready => {
+                    // run another loop in case more messages are waiting.
+                    // we must continue running until _something_ returns NotReady.
+                    return self.process_voice_commands();
+                }
+            }
+        } else {
+            // voice_cmd_rx returned NotReady above. Let's just prod the underlying connection to
+            // make some progress on sending.
+            self.upstream.poll_complete()?;
+        }
+
+        Ok(())
+    }
+
     pub fn connect(discord: Discord, shard_info: Option<[u8; 2]>, handle: &Handle) -> Self {
-        let mut conn = Connection {
+        let mut conn = Reconnector {
             handle: handle.clone(),
             session_info: Arc::new(Mutex::new(
                 SessionInfo {
@@ -39,8 +175,66 @@ impl Connection {
 
         conn._reconnect();
 
-        return conn;
+        return Connection {
+            upstream: conn,
+            voice_cmd_tx: None,
+            voice_cmd_rx: None,
+            pending_voice_cmd: None,
+            voice_channels: HashMap::new(),
+            session_id: None,
+            user_id: None
+        };
     }
+
+    fn setup_tx_channel(&mut self) {
+        if self.voice_cmd_tx.is_none() {
+            let (tx, rx) = mpsc::channel(1);
+            self.voice_cmd_rx = Some(rx);
+            self.voice_cmd_tx = Some(tx);
+        }
+    }
+
+    pub fn voice_handle(&mut self, server_id: ServerId) -> super::voice_internal::VoiceControlChannel {
+        self.setup_tx_channel();
+
+        use super::voice_internal::new_handle;
+        let (mut sink, handle) = new_handle(server_id, self.voice_cmd_tx.clone().unwrap());
+
+        // Replay initialization messages if needed
+        if self.user_id.is_some() {
+            // start_send here is guaranteed to not return NotReady as it contains a (boxed)
+            // StateUpdateSink
+            let _ = sink.start_send(VoiceChannelNotice::Init {user_id: self.user_id.unwrap()});
+
+            if self.session_id.is_some() {
+                let _ = sink.start_send(
+                    VoiceChannelNotice::SessionChange {session_id: self.session_id.clone().unwrap()}
+                );
+            }
+        }
+
+        self.voice_channels.insert(server_id, sink);
+
+        return handle;
+    }
+}
+
+/// This stream+sink offers a stream of events to/from discord that will automatically reconnect.
+/// Voice handling is performed at the Connection level.
+pub struct Reconnector {
+    handle: Handle,
+    session_info: SessionInfoRef,
+    state: ConnState
+}
+
+enum ConnState {
+    Connecting(LocalFuture<SingleConnection, Error>),
+    Active(SingleConnection),
+    Closed()
+}
+
+impl Reconnector {
+
 
     // Start the connection process, from any context (ignoring closed state etc)
     fn _reconnect(&mut self) {
@@ -106,7 +300,7 @@ impl Connection {
     }
 }
 
-impl Stream for Connection {
+impl Stream for Reconnector {
     type Item = Event;
     type Error = Error;
 
@@ -133,7 +327,7 @@ impl Stream for Connection {
     }
 }
 
-impl Sink for Connection {
+impl Sink for Reconnector {
     type SinkItem = serde_json::Value;
     type SinkError = Error;
 

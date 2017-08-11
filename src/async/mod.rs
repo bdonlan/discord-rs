@@ -6,6 +6,14 @@ mod single_conn;
 mod connection;
 #[cfg(feature="fault_injection")]
 mod fault_injection;
+mod state_update_sink;
+
+// We do some hijinks here with modules to let us expose certain APIs to connection.rs, but not to
+// third-party consumers of the crate.
+mod voice_internal;
+pub mod voice {
+    pub use super::voice_internal::public::*;
+}
 
 pub use self::connection::Connection;
 
@@ -25,6 +33,18 @@ mod internal {
     use websocket::{OwnedMessage, WebSocketError};
     use internal::PrivateDiscord;
     use tokio_timer::Timer;
+
+    /// A non-Send boxed Future
+    pub type LocalFuture<R, E> = Box<Future<Item=R, Error=E>>;
+
+    pub trait IntoLocalFuture<R, E> : Future<Item=R, Error=E> {
+        fn local_boxed(self) -> LocalFuture<R, E> where Self: Sized + 'static {
+            Box::new(self)
+        }
+    }
+
+    impl<T, R, E> IntoLocalFuture<R, E> for T
+        where T: Future<Item=R, Error=E> + Sized + 'static {}
 
     #[cfg(not(feature="fault_injection"))]
     type FaultInjecting<T> = T;

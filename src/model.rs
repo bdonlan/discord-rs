@@ -1940,6 +1940,7 @@ impl VoiceEvent {
 
 		let mut value = try!(remove(&mut value, "d").and_then(into_map));
 		if op == 2 {
+			// XXX: This is actually the 'ready' payload
 			warn_json!(value, VoiceEvent::Handshake {
 				heartbeat_interval: req!(try!(remove(&mut value, "heartbeat_interval")).as_u64()),
 				modes: try!(decode_array(try!(remove(&mut value, "modes")), into_string)),
@@ -1948,6 +1949,7 @@ impl VoiceEvent {
 				ip: try!(opt(&mut value, "ip", into_string)),
 			})
 		} else if op == 4 {
+			// XXX: Actually an OP4 session description
 			warn_json!(value, VoiceEvent::Ready {
 				mode: try!(remove(&mut value, "mode").and_then(into_string)),
 				secret_key: try!(decode_array(try!(remove(&mut value, "secret_key")),

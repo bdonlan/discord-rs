@@ -12,25 +12,6 @@ use std::collections::VecDeque;
 static GATEWAY_VERSION: u64 = 6;
 
 use Discord;
-pub fn test(h: &Handle, d: Discord) -> BoxFuture<SingleConnection, Error> {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    let info = SessionInfo {
-        discord: Arc::new(d),
-        gateway_url: None,
-        gateway_failures: 0,
-        session_id: None,
-        last_seq: 0,
-        shard_info: None,
-        keepalive_interval: 0,
-        timer: ::tokio_timer::Timer::default()
-    };
-
-    let sih = Arc::new(Mutex::new(info));
-
-    start_connect(h, sih)
-}
 
 /// This module handles initial connection negotiation, particularly handling session resumption
 /// (where feasible), and decoding of GatewayEvents into Events.
@@ -47,7 +28,7 @@ pub struct SingleConnection {
     // This queue is used to store things like pending keepalives in case the tx side
     // is stuffed up when we should have sent one
     internal_send_queue: VecDeque<serde_json::Value>,
-    next_keepalive: BoxFuture<(), Error>
+    next_keepalive: LocalFuture<(), Error>
 }
 
 impl SingleConnection {
@@ -59,7 +40,7 @@ impl SingleConnection {
         self.next_keepalive =
             timer.sleep(Duration::from_millis(keepalive_interval))
                  .map_err(Error::from)
-                 .boxed();
+                 .local_boxed();
 
         Ok(())
     }
@@ -81,7 +62,7 @@ impl SingleConnection {
             // If the tx side is filled up, we'll leave the timer future in the ready state, and
             // we'll come back to send as soon as there's room in the send queue.
             Ok(AsyncSink::NotReady(_)) => {
-                self.next_keepalive = future::ok(()).boxed();
+                self.next_keepalive = future::ok(()).local_boxed();
                 Ok(())
             },
             Err(e) => Err(e)
@@ -160,7 +141,7 @@ impl Stream for SingleConnection {
                     self.session_info.with(|info| info.last_seq = sequence);
 
                     // Arrange to a keepalive ASAP.
-                    self.next_keepalive = future::ok(()).boxed();
+                    self.next_keepalive = future::ok(()).local_boxed();
 
                     // ... and now give that send a chance to run
                     self.poll_complete()?;
@@ -189,7 +170,7 @@ enum ResumeResult {
 }
 
 pub fn start_connect(handle: &Handle, session_info: SessionInfoRef)
-    -> BoxFuture<SingleConnection, Error>
+    -> LocalFuture<SingleConnection, Error>
 {
     println!("!!! start_connect");
     let (gateway_failures, timer) = session_info.with(|info| {
@@ -227,7 +208,7 @@ pub fn start_connect(handle: &Handle, session_info: SessionInfoRef)
                     println!("!!! gateway lookup");
                     tx.send(discord_ref.__get_gateway(shard_info));
                 }) {
-                Err(e) => return future::err(Error::from(e)).boxed(),
+                Err(e) => return future::err(Error::from(e)).local_boxed(),
                 Ok(_) => {}
             }
 
@@ -244,9 +225,9 @@ pub fn start_connect(handle: &Handle, session_info: SessionInfoRef)
               })
               .box_via_err(&handle_ref, Error::Other("Unexpected error"))
         } else {
-            future::ok(gateway_url.unwrap()).boxed()
+            future::ok(gateway_url.unwrap()).local_boxed()
         }
-    }).box_via_err(&handle, Error::Other("Unexpected error"));
+    });
 
     let info_ref = session_info.clone();
     let handle_ref = handle.clone();
@@ -254,14 +235,14 @@ pub fn start_connect(handle: &Handle, session_info: SessionInfoRef)
         use websocket::ClientBuilder;
 
         match ClientBuilder::new(&gateway_url) {
-            Err(e) => future::err(Error::from(e)).boxed(),
+            Err(e) => future::err(Error::from(e)).local_boxed(),
             Ok(builder) => {
                 println!("!!! connecting to WS interface");
                 builder.async_connect(None, &handle_ref).map_err(Error::from)
                     .box_via_err(&handle_ref, Error::Other("Connect task died"))
             },
         }
-    }).box_via_err(&handle, Error::Other("Unexpected error"));
+    });
 
     let future = future.map(|(client, _headers)| {
           // We're connected, let's set up our client wrappers first
@@ -310,11 +291,11 @@ pub fn start_connect(handle: &Handle, session_info: SessionInfoRef)
     });
 
     // and that's all there is to it! Box it up and return.
-    future.box_via_err(&handle, Error::Other("Unexpected error"))
+    future.local_boxed()
 }
 
 fn session_handshake<C>(conn: C, session_info: SessionInfoRef)
-    -> BoxFuture<SingleConnection, Error>
+    -> LocalFuture<SingleConnection, Error>
     where C: Serializedish + Sized + Send + 'static
 {
     println!("!!! handshaking");
@@ -368,11 +349,11 @@ fn session_handshake<C>(conn: C, session_info: SessionInfoRef)
     conn.send(hello).and_then(move |conn| {
         println!("!!! handshake sent");
         await_handshake_result(conn, session_info_ref)
-    }).boxed()
+    }).local_boxed()
 }
 
 fn await_handshake_result<C>(conn: C, session_info: SessionInfoRef)
-                        -> BoxFuture<SingleConnection, Error>
+                        -> LocalFuture<SingleConnection, Error>
     where C: Serializedish + Sized + Send + 'static
 {
     conn.into_future()
@@ -383,7 +364,7 @@ fn await_handshake_result<C>(conn: C, session_info: SessionInfoRef)
             let is_resume = session_info.with(|info| info.session_id.is_some());
 
             match message {
-                None => return future::err(Error::Closed(None, "Unexpected close".into())).boxed(),
+                None => return future::err(Error::Closed(None, "Unexpected close".into())).local_boxed(),
                 Some(GatewayEvent::InvalidateSession) => {
                     {
                         println!("reject resume");
@@ -391,13 +372,13 @@ fn await_handshake_result<C>(conn: C, session_info: SessionInfoRef)
                         if sid.is_none() {
                             return future::err(Error::Protocol("Invalid session during handshake. \
                             Double-check your token or consider waiting 5 seconds between starting shards."))
-                                .boxed();
+                                .local_boxed();
                         }
                         // TODO - delay 1-5s
                         session_info.with(|info| info.session_id = None);
                     }
 
-                    return session_handshake(conn, session_info).boxed();
+                    return session_handshake(conn, session_info).local_boxed();
                 },
                 Some(GatewayEvent::Dispatch(seq, anyevent)) => {
                     session_info.with(|info| {
@@ -412,7 +393,7 @@ fn await_handshake_result<C>(conn: C, session_info: SessionInfoRef)
                         // ok
                     } else {
                         debug!("Unexpected event: {:?}", anyevent);
-                        return future::err(Error::Protocol("Expected Ready during handshake")).boxed();
+                        return future::err(Error::Protocol("Expected Ready during handshake")).local_boxed();
                     }
 
                     let single_conn = SingleConnection {
@@ -421,18 +402,18 @@ fn await_handshake_result<C>(conn: C, session_info: SessionInfoRef)
                         upstream: Box::new(conn),
                         internal_send_queue: VecDeque::new(),
                         // this will be overwritten shortly, so just drop a placeholder for now
-                        next_keepalive: future::ok(()).boxed()
+                        next_keepalive: future::ok(()).local_boxed()
                     };
 
                     println!("returning from resume");
 
-                    return future::ok(single_conn).boxed();
+                    return future::ok(single_conn).local_boxed();
                 }
                 other => {
                     debug!("Unexpected event: {:?}", other);
-                    return future::err(Error::Protocol("Expected Ready during handshake")).boxed()
+                    return future::err(Error::Protocol("Expected Ready during handshake")).local_boxed()
                 }
             }
         })
-        .boxed()
+        .local_boxed()
 }

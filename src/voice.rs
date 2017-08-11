@@ -1,29 +1,32 @@
+/*
 //! Voice communication module.
 //!
 //! A `VoiceConnection` for a server is obtained from a `Connection`. It can then be used to
 //! join a channel, change mute/deaf status, and play and receive audio.
-/*
+
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::sync::mpsc;
 use std::net::UdpSocket;
 
 use byteorder::{LittleEndian, BigEndian, WriteBytesExt, ReadBytesExt};
 use opus;
 use serde_json;
 use sodiumoxide::crypto::secretbox as crypto;
-use websocket::client::{Client, Sender};
-use websocket::stream::WebSocketStream;
+use futures::sync::mpsc;
+
+use async::imports::*;
 
 use model::*;
-use {Result, Error, SenderExt, ReceiverExt};
+use {Result, Error};
+
+use websocket::{self, ClientBuilder};
 
 /// An active or inactive voice connection, obtained from `Connection::voice`.
 pub struct VoiceConnection {
 	// primary WS send control
 	server_id: Option<ServerId>, // None for group and private calls
 	user_id: UserId,
-	main_ws: mpsc::Sender<::internal::Status>,
+	main_ws: mpsc::Sender<serde_json::Value>,
 	channel_id: Option<ChannelId>,
 	mute: bool,
 	deaf: bool,
@@ -33,7 +36,7 @@ pub struct VoiceConnection {
 	endpoint_token: Option<(String, String)>,
 
 	// voice thread (voice WS + UDP) control
-	sender: mpsc::Sender<Status>,
+	sender: mpsc::UnboundedSender<Status>,
 }
 
 /// A readable audio source.
@@ -79,8 +82,8 @@ pub trait AudioReceiver: Send {
 
 impl VoiceConnection {
 	#[doc(hidden)]
-	pub fn __new(server_id: Option<ServerId>, user_id: UserId, main_ws: mpsc::Sender<::internal::Status>) -> Self {
-		let (tx, rx) = mpsc::channel();
+	pub fn __new(server_id: Option<ServerId>, user_id: UserId, main_ws: mpsc::Sender<serde_json::Value>) -> Self {
+		let (tx, rx) = mpsc::unbounded();
 		start_voice_thread(server_id, rx);
 		VoiceConnection {
 			server_id: server_id,
@@ -135,7 +138,7 @@ impl VoiceConnection {
 
 	/// Send the connect/disconnect command over the main websocket
 	fn send_connect(&self) {
-		let _ = self.main_ws.send(::internal::Status::SendMessage(json! {{
+		let _ = self.main_ws.send(json! {{
 			"op": 4,
 			"d": {
 				"guild_id": self.server_id,
@@ -143,7 +146,7 @@ impl VoiceConnection {
 				"self_mute": self.mute,
 				"self_deaf": self.deaf,
 			}
-		}}));
+		}});
 	}
 
 	#[doc(hidden)]
@@ -203,13 +206,16 @@ impl VoiceConnection {
 	}
 
 	fn thread_send(&mut self, status: Status) {
-		match self.sender.send(status) {
+        // we need to specifically ask for UnboundedSender::send so we don't have to deal with
+        // futures shenanegans. Unfortunately the method has the same name and same arg types as
+        // Sink::send so automatic resolution won't work for us...
+		match mpsc::UnboundedSender::send(&self.sender, status) {
 			Ok(()) => {}
-			Err(mpsc::SendError(status)) => {
+			Err(_) => {
 				// voice thread has crashed... start it over again
-				let (tx, rx) = mpsc::channel();
+				let (tx, rx) = mpsc::unbounded();
 				self.sender = tx;
-				self.sender.send(status).unwrap(); // should be infallible
+				mpsc::UnboundedSender::send(&self.sender, status); // should be infallible
 				debug!("Restarting crashed voice thread...");
 				start_voice_thread(self.server_id, rx);
 				self.send_connect();
@@ -370,7 +376,7 @@ enum Status {
 	Disconnect,
 }
 
-fn start_voice_thread(server_id: Option<ServerId>, rx: mpsc::Receiver<Status>) {
+fn start_voice_thread(server_id: Option<ServerId>, rx: mpsc::UnboundedReceiver<Status>) {
 	let name = match server_id {
 		Some(ServerId(id)) => format!("discord voice (server {})", id),
 		None => "discord voice (private/groups)".to_owned(),
@@ -381,7 +387,7 @@ fn start_voice_thread(server_id: Option<ServerId>, rx: mpsc::Receiver<Status>) {
 		.expect("Failed to start voice thread");
 }
 
-fn voice_thread(channel: mpsc::Receiver<Status>) {
+fn voice_thread(mut channel: mpsc::UnboundedReceiver<Status>) {
 	let mut audio_source = None;
 	let mut receiver = None;
 	let mut connection = None;
@@ -391,17 +397,17 @@ fn voice_thread(channel: mpsc::Receiver<Status>) {
 	'outer: loop {
 		// Check on the signalling channel
 		loop {
-			match channel.try_recv() {
-				Ok(Status::SetSource(s)) => audio_source = s,
-				Ok(Status::SetReceiver(r)) => receiver = r,
-				Ok(Status::Connect(info)) => {
+			match channel.poll() {
+				Ok(Async::Ready(Some(Status::SetSource(s)))) => audio_source = s,
+				Ok(Async::Ready(Some(Status::SetReceiver(r)))) => receiver = r,
+				Ok(Async::Ready(Some(Status::Connect(info)))) => {
 					connection = InternalConnection::new(info).map_err(
 						|e| error!("Error connecting to voice: {:?}", e)
 					).ok();
 				},
-				Ok(Status::Disconnect) => connection = None,
-				Err(mpsc::TryRecvError::Empty) => break,
-				Err(mpsc::TryRecvError::Disconnected) => break 'outer,
+				Ok(Async::Ready(Some(Status::Disconnect))) => connection = None,
+				Ok(Async::NotReady) => break,
+				Err(_) => break 'outer,
 			}
 		}
 
@@ -434,7 +440,7 @@ struct ConnStartInfo {
 
 struct InternalConnection {
 	sender: Sender<WebSocketStream>,
-	receive_chan: mpsc::Receiver<RecvStatus>,
+	receive_chan: mpsc::UnboundedReceiver<RecvStatus>,
 	encryption_key: crypto::Key,
 	udp: UdpSocket,
 	destination: ::std::net::SocketAddr,
@@ -564,13 +570,13 @@ impl InternalConnection {
 		let thread = ::std::thread::current();
 		let thread_name = thread.name().unwrap_or("discord voice");
 		let receive_chan = {
-			let (tx1, rx) = mpsc::channel();
+			let (tx1, rx) = mpsc::unbounded();
 			let tx2 = tx1.clone();
 			let udp_clone = try!(udp.try_clone());
 			try!(::std::thread::Builder::new()
 				.name(format!("{} (WS reader)", thread_name))
 				.spawn(move || while let Ok(msg) = receiver.recv_json(VoiceEvent::decode) {
-					match tx1.send(RecvStatus::Websocket(msg)) {
+					match mpsc::UnboundedSender::send(&tx1, RecvStatus::Websocket(msg)) {
 						Ok(()) => {},
 						Err(_) => return
 					}
@@ -581,7 +587,7 @@ impl InternalConnection {
 					let mut buffer = [0; 512];
 					loop {
 						let (len, _) = udp_clone.recv_from(&mut buffer).unwrap();
-						match tx2.send(RecvStatus::Udp(buffer[..len].iter().cloned().collect())) {
+						match mpsc::UnboundedSender::send(&tx2, RecvStatus::Udp(buffer[..len].iter().cloned().collect())) {
 							Ok(()) => {},
 							Err(_) => return
 						}
@@ -624,8 +630,12 @@ impl InternalConnection {
 
 		// Check for received voice data
 		if let Some(receiver) = receiver.as_mut() {
-			while let Ok(status) = self.receive_chan.try_recv() {
-				match status {
+			while let Ok(Async::Ready(status)) = self.receive_chan.poll() {
+                if status.is_none() {
+                    return Err(Error::Closed(None, "Voice connection closed".into()));
+                }
+
+				match status.unwrap() {
 					RecvStatus::Websocket(VoiceEvent::SpeakingUpdate { user_id, ssrc, speaking }) => {
 						receiver.speaking_update(ssrc, user_id, speaking);
 					},
@@ -650,7 +660,7 @@ impl InternalConnection {
 			}
 		} else {
 			// if there's no receiver, discard incoming events
-			while let Ok(_) = self.receive_chan.try_recv() {}
+			while let Ok(Async::Ready(Some(_))) = self.receive_chan.poll() {}
 		}
 
 		// Send the voice websocket keepalive if needed
